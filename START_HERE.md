@@ -128,3 +128,10 @@ pip install -r requirements.txt
 **TechScout URL**: http://localhost:7861  
 **LM Studio URL**: http://localhost:1234
 
+
+
+
+
+
+
+
