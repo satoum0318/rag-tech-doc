@@ -15,6 +15,7 @@ import pdfplumber
 from langchain_core.documents import Document
 from openai import OpenAI
 import ipaddress
+import time
 
 # グローバル変数でretrieverとLM Studio clientを保持
 retriever = None
@@ -189,101 +190,155 @@ def load_documents(documents_path: str = "./documents") -> List:
         "20250124_SPC,MD_h051512_IEEJ-20250120X10203.pdf",
         "20240710_FTE,PE,HV_h051512_IEEJ-20240707X15001.pdf",  # 処理が止まる問題のあるPDF
     }
+    
+    # 問題のあるPDFパターン（ファイル名に含まれる文字列でスキップ）
+    skip_pdf_patterns = [
+        "EPP,SA,SP",  # このパターンのPDFは処理が非常に時間がかかるかフリーズする
+    ]
 
     for idx, file_path in enumerate(pdf_files, 1):
         basename = os.path.basename(file_path)
+        
+        # スキップリストのチェック（確実にスキップするため、複数の方法でチェック）
+        should_skip = False
+        
+        # 完全一致チェック
         if basename in skip_pdf_basenames:
+            should_skip = True
+        
+        # パターンマッチングチェック
+        if not should_skip:
+            for pattern in skip_pdf_patterns:
+                if pattern in basename:
+                    should_skip = True
+                    break
+        
+        # 部分一致チェック（ファイル名に含まれるか）
+        if not should_skip:
+            for skip_name in skip_pdf_basenames:
+                if skip_name in basename or basename in skip_name:
+                    should_skip = True
+                    break
+        
+        if should_skip:
             print(f"  [{idx}/{total_pdfs}] [WARNING] Skipping known problematic PDF: {basename}")
             continue
 
         print(f"  [{idx}/{total_pdfs}] Loading: {basename}")
         loaded = False
+        start_time = time.time()
+        timeout_seconds = 60  # 60秒でタイムアウト
         
-        # まずPyPDFで試す（速くて安定している）
+        # 全体をtry-exceptで囲んで、予期しないエラーでも続行
         try:
-            loader = PyPDFLoader(file_path)
-            pdf_docs = loader.load()
-            documents.extend(pdf_docs)
-            print(f"    ✓ {len(pdf_docs)} pages loaded (PyPDF)")
-            loaded = True
-        except KeyboardInterrupt:
-            # ユーザーが中断した場合
-            raise
-        except SystemExit:
-            # システム終了
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            # 解凍制限エラーを検出
-            if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
-                print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
-                print(f"      Error: {error_msg[:150]}")
-                continue
-            # その他の予期しないエラーもスキップして続行
-            print(f"    [WARNING] PyPDF failed for {basename}: {error_msg[:150]}")
-            print(f"    [INFO] Skipping this PDF and continuing...")
-        
-        # PyPDFで失敗した場合のみpdfplumberを試す
-        if not loaded:
+            # まずPyPDFで試す（速くて安定している）
             try:
-                print(f"    Trying pdfplumber...")
-                import re
-                import warnings
+                # タイムアウトチェック
+                if time.time() - start_time > timeout_seconds:
+                    print(f"    [WARNING] Timeout while loading {basename}, skipping...")
+                    continue
                 
-                # ワーニングを抑制
-                warnings.filterwarnings('ignore')
+                loader = PyPDFLoader(file_path)
+                pdf_docs = loader.load()
                 
-                pdf_docs = []
-                with pdfplumber.open(file_path) as pdf:
-                    total_pages = len(pdf.pages)
-                    
-                    # ページ数が多い場合は最初の数ページで処理時間を推定
-                    for page_num, page in enumerate(pdf.pages):
-                        try:
-                            # テキストを抽出
-                            text = page.extract_text()
-                            
-                            if text:
-                                # テキストのクリーニング
-                                text = text.replace('\x00', '')
-                                text = re.sub(r'\s+', ' ', text)
-                                text = text.strip()
-                                
-                                # LangChain Documentオブジェクトを作成
-                                doc = Document(
-                                    page_content=text,
-                                    metadata={
-                                        'source': file_path,
-                                        'page': page_num,
-                                        'total_pages': total_pages
-                                    }
-                                )
-                                pdf_docs.append(doc)
-                        except Exception as page_error:
-                            print(f"    [WARNING] Page {page_num} skipped: {str(page_error)[:50]}")
-                            continue
-                
-                if pdf_docs:
-                    documents.extend(pdf_docs)
-                    print(f"    ✓ {len(pdf_docs)} pages loaded (pdfplumber)")
-                    loaded = True
-                
+                # タイムアウトチェック
+                if time.time() - start_time > timeout_seconds:
+                    print(f"    [WARNING] Timeout after loading {basename}, skipping...")
+                    continue
+                documents.extend(pdf_docs)
+                print(f"    ✓ {len(pdf_docs)} pages loaded (PyPDF)")
+                loaded = True
             except KeyboardInterrupt:
+                # ユーザーが中断した場合
                 raise
             except SystemExit:
+                # システム終了
                 raise
             except Exception as e:
                 error_msg = str(e)
+                # 解凍制限エラーを検出
                 if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
                     print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
                     print(f"      Error: {error_msg[:150]}")
                     continue
                 # その他の予期しないエラーもスキップして続行
-                print(f"    [WARNING] pdfplumber failed for {basename}: {error_msg[:150]}")
+                print(f"    [WARNING] PyPDF failed for {basename}: {error_msg[:150]}")
                 print(f"    [INFO] Skipping this PDF and continuing...")
+            
+            # PyPDFで失敗した場合のみpdfplumberを試す
+            if not loaded:
+                try:
+                    print(f"    Trying pdfplumber...")
+                    import re
+                    import warnings
+                    
+                    # ワーニングを抑制
+                    warnings.filterwarnings('ignore')
+                    
+                    pdf_docs = []
+                    with pdfplumber.open(file_path) as pdf:
+                        total_pages = len(pdf.pages)
+                        
+                        # ページ数が多い場合は最初の数ページで処理時間を推定
+                        for page_num, page in enumerate(pdf.pages):
+                            try:
+                                # テキストを抽出
+                                text = page.extract_text()
+                                
+                                if text:
+                                    # テキストのクリーニング
+                                    text = text.replace('\x00', '')
+                                    text = re.sub(r'\s+', ' ', text)
+                                    text = text.strip()
+                                
+                                    # LangChain Documentオブジェクトを作成
+                                    doc = Document(
+                                        page_content=text,
+                                        metadata={
+                                            'source': file_path,
+                                            'page': page_num,
+                                            'total_pages': total_pages
+                                        }
+                                    )
+                                    pdf_docs.append(doc)
+                            except Exception as page_error:
+                                print(f"    [WARNING] Page {page_num} skipped: {str(page_error)[:50]}")
+                                continue
+                    
+                    if pdf_docs:
+                        documents.extend(pdf_docs)
+                        print(f"    ✓ {len(pdf_docs)} pages loaded (pdfplumber)")
+                        loaded = True
+                    
+                except KeyboardInterrupt:
+                    raise
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    error_msg = str(e)
+                    if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
+                        print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
+                        print(f"      Error: {error_msg[:150]}")
+                        continue
+                    # その他の予期しないエラーもスキップして続行
+                    print(f"    [WARNING] pdfplumber failed for {basename}: {error_msg[:150]}")
+                    print(f"    [INFO] Skipping this PDF and continuing...")
+            
+            if not loaded:
+                print(f"    ✗ Failed to load {os.path.basename(file_path)}")
         
-        if not loaded:
-            print(f"    ✗ Failed to load {os.path.basename(file_path)}")
+        except KeyboardInterrupt:
+            raise
+        except SystemExit:
+            raise
+        except Exception as e:
+            # 予期しないエラーが発生した場合
+            error_msg = str(e)
+            print(f"    [ERROR] Unexpected error while processing {basename}: {error_msg[:200]}")
+            print(f"    [INFO] Skipping this PDF and continuing...")
+            import traceback
+            print(f"    [DEBUG] Traceback: {traceback.format_exc()[:300]}")
+            continue
     
     # DOCXファイルを読み込む
     docx_files = glob.glob(os.path.join(documents_path, "*.docx"))
@@ -320,7 +375,10 @@ def create_vector_store(documents: List):
     # 空のテキストやNoneを含むチャンクをフィルタリング
     filtered_chunks = []
     for chunk in chunks:
-        if chunk.page_content and chunk.page_content.strip():
+        # 文字列型であることを確認
+        if (chunk.page_content and 
+            isinstance(chunk.page_content, str) and 
+            chunk.page_content.strip()):
             # テキストをクリーニング（制御文字や不正な文字を除去）
             cleaned_text = chunk.page_content.strip()
             # Noneや空文字列でないことを確認
@@ -349,13 +407,46 @@ def create_vector_store(documents: List):
         batch_size = 1000
         if len(chunks) > batch_size:
             print(f"  Processing {len(chunks)} chunks in batches of {batch_size}...")
+            
+            # バッチを検証してフィルタリングする関数
+            def validate_batch(batch_chunks):
+                """バッチ内のチャンクを検証し、有効なものだけを返す"""
+                valid_chunks = []
+                for chunk in batch_chunks:
+                    # テキストが文字列型で、空でないことを確認
+                    if (chunk.page_content and 
+                        isinstance(chunk.page_content, str) and 
+                        chunk.page_content.strip() and
+                        len(chunk.page_content.strip()) > 0):
+                        # 制御文字や不正な文字を除去
+                        cleaned = chunk.page_content.strip()
+                        # Noneや空文字列でないことを再確認
+                        if cleaned:
+                            chunk.page_content = cleaned
+                            valid_chunks.append(chunk)
+                return valid_chunks
+            
             # 最初のバッチでベクトルストアを作成
-            vector_store = FAISS.from_documents(chunks[:batch_size], embeddings)
+            first_batch = validate_batch(chunks[:batch_size])
+            if not first_batch:
+                raise ValueError("No valid chunks in first batch")
+            vector_store = FAISS.from_documents(first_batch, embeddings)
+            
             # 残りのバッチを追加
             for i in range(batch_size, len(chunks), batch_size):
                 batch = chunks[i:i+batch_size]
-                vector_store.add_documents(batch)
-                print(f"  Processed {min(i+batch_size, len(chunks))}/{len(chunks)} chunks...")
+                # バッチを検証してフィルタリング
+                valid_batch = validate_batch(batch)
+                if valid_batch:
+                    try:
+                        vector_store.add_documents(valid_batch)
+                        print(f"  Processed {min(i+batch_size, len(chunks))}/{len(chunks)} chunks...")
+                    except Exception as batch_error:
+                        print(f"  [WARNING] Error processing batch {i//batch_size + 1}: {str(batch_error)[:100]}")
+                        print(f"  Skipping this batch and continuing...")
+                        continue
+                else:
+                    print(f"  [WARNING] Batch {i//batch_size + 1} had no valid chunks, skipping...")
         else:
             vector_store = FAISS.from_documents(chunks, embeddings)
         print("[OK] Vector store created")
@@ -642,13 +733,13 @@ def main():
     setup_qa_chain("./documents")
     
     # Gradioチャットインターフェースを作成
-    with gr.Blocks(title="TechScout - RAG Document Search", css=".small-text { font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px; }") as demo:
+    with gr.Blocks(title="TechScout - RAG Document Search") as demo:
         gr.Markdown(
             """
             # 🔍 TechScout
             ### RAG技術文書検索システム
             
-            <div class="small-text">
+            <div style="font-size: 0.85em; color: #666; margin-top: -15px; margin-bottom: 20px;">
             2025年11月14日<br>
             東洋電機製造株式会社<br>
             開発センター基盤技術部
