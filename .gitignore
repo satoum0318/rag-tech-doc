@@ -56,6 +56,7 @@ documents/*.docx
 # FAISSインデックス（再生成可能）
 *.faiss
 *.pkl
+vectorstore_cache/
 
 # ログファイル
 *.log
