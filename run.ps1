@@ -1,5 +1,13 @@
 # RAG Tech Doc Search - Quick Launcher
-# Encoding: UTF-8
+# Encoding: UTF-8 with BOM
+
+# Force UTF-8 encoding for console output
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+chcp 65001 | Out-Null
 
 param(
     [Parameter(Position=0)]
@@ -7,10 +15,14 @@ param(
     [string]$Mode = "lmstudio"
 )
 
+# Store header text (ASCII only to avoid mojibake)
+$companyName = "Toyo Denki Seizo Co., Ltd."
+$deptName = "Development Center - Core Technology Dept."
+
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "TechScout - Quick Launcher" -ForegroundColor Cyan
-Write-Host "東洋電機製造株式会社" -ForegroundColor White
-Write-Host "開発センター基盤技術部" -ForegroundColor White
+Write-Host $companyName -ForegroundColor White
+Write-Host $deptName -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 

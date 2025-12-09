@@ -26,3 +26,6 @@ gradio>=4.0.0
 # Utilities
 ipaddress>=1.0.23
 cryptography>=3.1  # For encrypted PDF support
+
+# LM Studio integration
+openai>=1.0.0  # For LM Studio API communication

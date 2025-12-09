@@ -177,49 +177,113 @@ def load_documents(documents_path: str = "./documents") -> List:
         except Exception as e:
             print(f"  [WARNING] Failed to load {file_path}: {e}")
     
-    # PDFファイルを読み込む（pdfplumberで高品質抽出）
+    # PDFファイルを読み込む（PyPDF優先、pdfplumberはフォールバック）
     pdf_files = glob.glob(os.path.join(documents_path, "*.pdf"))
-    for file_path in pdf_files:
+    total_pdfs = len(pdf_files)
+    
+    if total_pdfs > 0:
+        print(f"  Found {total_pdfs} PDF files")
+
+    # 既知の問題を持つPDFをスキップ（解凍制限エラー対策）
+    skip_pdf_basenames = {
+        "20250124_SPC,MD_h051512_IEEJ-20250120X10203.pdf",
+        "20240710_FTE,PE,HV_h051512_IEEJ-20240707X15001.pdf",  # 処理が止まる問題のあるPDF
+    }
+
+    for idx, file_path in enumerate(pdf_files, 1):
+        basename = os.path.basename(file_path)
+        if basename in skip_pdf_basenames:
+            print(f"  [{idx}/{total_pdfs}] [WARNING] Skipping known problematic PDF: {basename}")
+            continue
+
+        print(f"  [{idx}/{total_pdfs}] Loading: {basename}")
+        loaded = False
+        
+        # まずPyPDFで試す（速くて安定している）
         try:
-            print(f"  - Loading: {os.path.basename(file_path)}")
-            
-            # pdfplumberで読み込み（日本語に強い）
-            pdf_docs = []
-            with pdfplumber.open(file_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
-                    # テキストを抽出
-                    text = page.extract_text()
-                    
-                    if text:
-                        # テキストのクリーニング
-                        import re
-                        text = text.replace('\x00', '')
-                        text = re.sub(r'\s+', ' ', text)
-                        text = text.strip()
-                        
-                        # LangChain Documentオブジェクトを作成
-                        doc = Document(
-                            page_content=text,
-                            metadata={
-                                'source': file_path,
-                                'page': page_num,
-                                'total_pages': len(pdf.pages)
-                            }
-                        )
-                        pdf_docs.append(doc)
-            
+            loader = PyPDFLoader(file_path)
+            pdf_docs = loader.load()
             documents.extend(pdf_docs)
-            print(f"    ✓ {len(pdf_docs)} pages loaded")
+            print(f"    ✓ {len(pdf_docs)} pages loaded (PyPDF)")
+            loaded = True
+        except KeyboardInterrupt:
+            # ユーザーが中断した場合
+            raise
+        except SystemExit:
+            # システム終了
+            raise
         except Exception as e:
-            print(f"  [WARNING] Failed to load {file_path}: {e}")
-            # フォールバック: PyPDFLoaderを試す
+            error_msg = str(e)
+            # 解凍制限エラーを検出
+            if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
+                print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
+                print(f"      Error: {error_msg[:150]}")
+                continue
+            # その他の予期しないエラーもスキップして続行
+            print(f"    [WARNING] PyPDF failed for {basename}: {error_msg[:150]}")
+            print(f"    [INFO] Skipping this PDF and continuing...")
+        
+        # PyPDFで失敗した場合のみpdfplumberを試す
+        if not loaded:
             try:
-                print(f"    Trying fallback method...")
-                loader = PyPDFLoader(file_path)
-                documents.extend(loader.load())
-                print(f"    ✓ Loaded with fallback")
-            except:
-                pass
+                print(f"    Trying pdfplumber...")
+                import re
+                import warnings
+                
+                # ワーニングを抑制
+                warnings.filterwarnings('ignore')
+                
+                pdf_docs = []
+                with pdfplumber.open(file_path) as pdf:
+                    total_pages = len(pdf.pages)
+                    
+                    # ページ数が多い場合は最初の数ページで処理時間を推定
+                    for page_num, page in enumerate(pdf.pages):
+                        try:
+                            # テキストを抽出
+                            text = page.extract_text()
+                            
+                            if text:
+                                # テキストのクリーニング
+                                text = text.replace('\x00', '')
+                                text = re.sub(r'\s+', ' ', text)
+                                text = text.strip()
+                                
+                                # LangChain Documentオブジェクトを作成
+                                doc = Document(
+                                    page_content=text,
+                                    metadata={
+                                        'source': file_path,
+                                        'page': page_num,
+                                        'total_pages': total_pages
+                                    }
+                                )
+                                pdf_docs.append(doc)
+                        except Exception as page_error:
+                            print(f"    [WARNING] Page {page_num} skipped: {str(page_error)[:50]}")
+                            continue
+                
+                if pdf_docs:
+                    documents.extend(pdf_docs)
+                    print(f"    ✓ {len(pdf_docs)} pages loaded (pdfplumber)")
+                    loaded = True
+                
+            except KeyboardInterrupt:
+                raise
+            except SystemExit:
+                raise
+            except Exception as e:
+                error_msg = str(e)
+                if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
+                    print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
+                    print(f"      Error: {error_msg[:150]}")
+                    continue
+                # その他の予期しないエラーもスキップして続行
+                print(f"    [WARNING] pdfplumber failed for {basename}: {error_msg[:150]}")
+                print(f"    [INFO] Skipping this PDF and continuing...")
+        
+        if not loaded:
+            print(f"    ✗ Failed to load {os.path.basename(file_path)}")
     
     # DOCXファイルを読み込む
     docx_files = glob.glob(os.path.join(documents_path, "*.docx"))
@@ -252,7 +316,24 @@ def create_vector_store(documents: List):
         length_function=len,
     )
     chunks = text_splitter.split_documents(documents)
-    print(f"[OK] Created {len(chunks)} chunks")
+    
+    # 空のテキストやNoneを含むチャンクをフィルタリング
+    filtered_chunks = []
+    for chunk in chunks:
+        if chunk.page_content and chunk.page_content.strip():
+            # テキストをクリーニング（制御文字や不正な文字を除去）
+            cleaned_text = chunk.page_content.strip()
+            # Noneや空文字列でないことを確認
+            if cleaned_text and len(cleaned_text) > 0:
+                chunk.page_content = cleaned_text
+                filtered_chunks.append(chunk)
+    
+    original_count = len(chunks)
+    chunks = filtered_chunks
+    print(f"[OK] Created {len(chunks)} chunks (filtered from {original_count} total)")
+    
+    if not chunks:
+        raise ValueError("No valid chunks found after filtering. Please check your documents.")
     
     print("[2/4] Loading embedding model...")
     # sentence-transformersを使用した埋め込みモデル
@@ -262,9 +343,27 @@ def create_vector_store(documents: List):
     )
     
     print("[3/4] Creating FAISS vector store...")
-    # FAISSベクトルストアを作成
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    print("[OK] Vector store created")
+    # FAISSベクトルストアを作成（バッチ処理でメモリ効率を向上）
+    try:
+        # 大量のチャンクがある場合、バッチ処理で分割
+        batch_size = 1000
+        if len(chunks) > batch_size:
+            print(f"  Processing {len(chunks)} chunks in batches of {batch_size}...")
+            # 最初のバッチでベクトルストアを作成
+            vector_store = FAISS.from_documents(chunks[:batch_size], embeddings)
+            # 残りのバッチを追加
+            for i in range(batch_size, len(chunks), batch_size):
+                batch = chunks[i:i+batch_size]
+                vector_store.add_documents(batch)
+                print(f"  Processed {min(i+batch_size, len(chunks))}/{len(chunks)} chunks...")
+        else:
+            vector_store = FAISS.from_documents(chunks, embeddings)
+        print("[OK] Vector store created")
+    except Exception as e:
+        print(f"[ERROR] Failed to create vector store: {e}")
+        print(f"  Number of chunks: {len(chunks)}")
+        print(f"  Sample chunk content (first 100 chars): {chunks[0].page_content[:100] if chunks else 'N/A'}")
+        raise
     
     return vector_store
 
@@ -319,7 +418,16 @@ def setup_qa_chain(documents_path: str = "./documents"):
     print("=" * 60)
     
     # ステップ1: ドキュメントを読み込む
-    documents = load_documents(documents_path)
+    try:
+        documents = load_documents(documents_path)
+    except KeyboardInterrupt:
+        print("\n[INFO] Document loading interrupted by user")
+        raise
+    except Exception as e:
+        print(f"\n[ERROR] Failed to load documents: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
     
     if not documents:
         print("[WARNING] No documents found")
