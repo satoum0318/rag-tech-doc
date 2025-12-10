@@ -178,127 +178,70 @@ def load_documents(documents_path: str = "./documents") -> List:
         except Exception as e:
             print(f"  [WARNING] Failed to load {file_path}: {e}")
     
-    # PDFファイルを読み込む（PyPDF優先、pdfplumberはフォールバック）
+    # PDFファイルを読み込む（サブプロセスで安全に実行）
+    import json
+    import subprocess
+    import sys
+
     pdf_files = glob.glob(os.path.join(documents_path, "*.pdf"))
     total_pdfs = len(pdf_files)
     
     if total_pdfs > 0:
         print(f"  Found {total_pdfs} PDF files")
 
-    # 既知の問題を持つPDFをスキップ（解凍制限エラー対策）
-    skip_pdf_basenames = {
-        "20250124_SPC,MD_h051512_IEEJ-20250120X10203.pdf",
-        "20240710_FTE,PE,HV_h051512_IEEJ-20240707X15001.pdf",  # 処理が止まる問題のあるPDF
-    }
-    
-    # 問題のあるPDFパターン（ファイル名に含まれる文字列でスキップ）
-    skip_pdf_patterns = [
-        "EPP,SA,SP",  # このパターンのPDFは処理が非常に時間がかかるかフリーズする
-    ]
+    # 以前のスキップリストは不要になったため削除しました
+    # サブプロセス化により、クラッシュするファイルは自動的にスキップされます
 
     for idx, file_path in enumerate(pdf_files, 1):
         basename = os.path.basename(file_path)
-        
-        # スキップリストのチェック（確実にスキップするため、複数の方法でチェック）
-        should_skip = False
-        
-        # 完全一致チェック
-        if basename in skip_pdf_basenames:
-            should_skip = True
-        
-        # パターンマッチングチェック
-        if not should_skip:
-            for pattern in skip_pdf_patterns:
-                if pattern in basename:
-                    should_skip = True
-                    break
-        
-        # 部分一致チェック（ファイル名に含まれるか）
-        if not should_skip:
-            for skip_name in skip_pdf_basenames:
-                if skip_name in basename or basename in skip_name:
-                    should_skip = True
-                    break
-        
-        if should_skip:
-            print(f"  [{idx}/{total_pdfs}] [WARNING] Skipping known problematic PDF: {basename}")
-            continue
-
         print(f"  [{idx}/{total_pdfs}] Loading: {basename}")
-        loaded = False
-        start_time = time.time()
-        timeout_seconds = 60  # 60秒でタイムアウト
         
-        # 全体をtry-exceptで囲んで、予期しないエラーでも続行
         try:
-            # pdfplumberを優先して試す（日本語エンコーディングに強く安定しているため）
-            try:
-                import re
-                import warnings
-                # 特定の警告を無視
-                warnings.filterwarnings('ignore')
-                
-                pdf_docs = []
-                # pdfplumberで読み込み
-                with pdfplumber.open(file_path) as pdf:
-                    total_pages_in_pdf = len(pdf.pages)
-                    for page_num, page in enumerate(pdf.pages):
-                        try:
-                            text = page.extract_text()
-                            if text:
-                                text = text.replace('\x00', '').strip()
-                                text = re.sub(r'\s+', ' ', text).strip()
-                                if text: 
-                                    doc = Document(page_content=text, metadata={'source': file_path, 'page': page_num, 'total_pages': total_pages_in_pdf})
-                                    pdf_docs.append(doc)
-                        except Exception as page_error:
-                            pass
-                
-                if pdf_docs:
-                    documents.extend(pdf_docs)
-                    print(f"    ✓ {len(pdf_docs)} pages loaded (pdfplumber)")
-                    loaded = True
-                
-            except KeyboardInterrupt:
-                raise
-            except SystemExit:
-                raise
-            except Exception as e:
-                error_msg = str(e)
-                if "Limit reached while decompressing" in error_msg or "XFormObject" in error_msg or "Impossible to decode" in error_msg:
-                    print(f"    [WARNING] Skipping PDF with decompression limit error: {basename}")
-                    print(f"      Error: {error_msg[:150]}")
-                    continue
-                print(f"    [WARNING] pdfplumber failed for {basename}: {error_msg[:150]}")
-                print(f"    [INFO] Trying PyPDF as fallback...")
+            # pdf_worker.py をサブプロセスとして実行
+            # これにより、PDF読み込み中にクラッシュしてもメインプロセスは守られる
+            result = subprocess.run(
+                [sys.executable, "pdf_worker.py", file_path],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                timeout=60  # 60秒でタイムアウト
+            )
             
-            # pdfplumberで失敗した場合のみPyPDFを試す
-            if not loaded:
+            if result.returncode == 0:
+                # 成功した場合、JSON出力をパース
                 try:
-                    loader = PyPDFLoader(file_path)
-                    pdf_docs = loader.load()
-                    documents.extend(pdf_docs)
-                    print(f"    ✓ {len(pdf_docs)} pages loaded (PyPDF)")
-                    loaded = True
-                except Exception as e:
-                    print(f"    [WARNING] PyPDF failed too: {str(e)[:150]}")
-            
-            if not loaded:
-                print(f"    ✗ Failed to load {os.path.basename(file_path)}")
-        
-        except KeyboardInterrupt:
-            raise
-        except SystemExit:
-            raise
+                    loaded_docs_data = json.loads(result.stdout)
+                    
+                    # 辞書データをDocumentオブジェクトに変換
+                    loaded_count = 0
+                    for doc_data in loaded_docs_data:
+                        doc = Document(
+                            page_content=doc_data['page_content'],
+                            metadata=doc_data['metadata']
+                        )
+                        documents.append(doc)
+                        loaded_count += 1
+                        
+                    loader_name = loaded_docs_data[0]['metadata'].get('loader', 'unknown')
+                    print(f"    ✓ {loaded_count} pages loaded ({loader_name})")
+                    
+                except json.JSONDecodeError:
+                    print(f"    [WARNING] Failed to parse worker output for {basename}")
+            else:
+                # 失敗した場合（クラッシュ含む）
+                error_msg = result.stderr.strip()
+                if not error_msg:
+                    error_msg = "Process crashed or returned no output"
+                
+                print(f"    [WARNING] Failed to load {basename} (skipped)")
+                # エラー詳細を表示（デバッグ用）
+                # print(f"      Error: {error_msg[:200]}")
+                
+        except subprocess.TimeoutExpired:
+            print(f"    [WARNING] Timeout while loading {basename} (skipped)")
         except Exception as e:
-            # 予期しないエラーが発生した場合
-            error_msg = str(e)
-            print(f"    [ERROR] Unexpected error while processing {basename}: {error_msg[:200]}")
-            print(f"    [INFO] Skipping this PDF and continuing...")
-            import traceback
-            print(f"    [DEBUG] Traceback: {traceback.format_exc()[:300]}")
-            continue
-    
+            print(f"    [ERROR] Unexpected error executing worker: {e}")
+            
     # DOCXファイルを読み込む
     docx_files = glob.glob(os.path.join(documents_path, "*.docx"))
     for file_path in docx_files:
@@ -815,14 +758,29 @@ def main():
     print(f"  - IP restriction: {', '.join(ALLOWED_IP_RANGES)}")
     print(f"  - Authentication: Enabled ({len(VALID_USERS)} users)")
     print("=" * 60)
-    demo.launch(
-        share=False,  # 公開リンクを生成しない
-        server_name="0.0.0.0",  # LAN内の全てのマシンからアクセス可能
-        server_port=7861,  # ポート番号（7860が使用中のため7861に変更）
-        auth=authenticate_user,  # ユーザー名/パスワード認証
-        auth_message="🔍 TechScout - 東洋電機製造株式会社 開発センター基盤技術部",
-    )
+    
+    try:
+        demo.launch(
+            share=False,  # 公開リンクを生成しない
+            server_name="0.0.0.0",  # LAN内の全てのマシンからアクセス可能
+            server_port=7861,  # ポート番号（7860が使用中のため7861に変更）
+            auth=authenticate_user,  # ユーザー名/パスワード認証
+            auth_message="🔍 TechScout - 東洋電機製造株式会社 開発センター基盤技術部",
+        )
+    except KeyboardInterrupt:
+        print("\n[INFO] Server stopped by user")
+        return
 
 if __name__ == "__main__":
-    main()
+    import sys
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Application stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[ERROR] Application crashed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
