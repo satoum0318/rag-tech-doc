@@ -227,8 +227,48 @@ def load_documents(documents_path: str = "./documents") -> List:
                         break
             
             if is_cache_valid and cached_documents:
-                print(f"  [OK] Loaded {len(cached_documents)} documents from cache (Fast Load)")
-                return cached_documents
+                # キャッシュから読み込んだドキュメントをDocumentオブジェクトに変換
+                # メタデータをクリーンアップしてシリアライズ可能にする
+                cleaned_documents = []
+                for doc in cached_documents:
+                    # 既にDocumentオブジェクトの場合はそのまま使用
+                    if isinstance(doc, Document):
+                        # メタデータをクリーンアップ
+                        cleaned_metadata = {}
+                        for key, value in doc.metadata.items():
+                            # シリアライズ可能な型のみを保持
+                            if isinstance(value, (str, int, float, bool, type(None))):
+                                cleaned_metadata[key] = value
+                            elif isinstance(value, (list, tuple)):
+                                # リストやタプルは文字列に変換
+                                cleaned_metadata[key] = str(value)
+                            else:
+                                # その他は文字列に変換
+                                cleaned_metadata[key] = str(value)
+                        doc.metadata = cleaned_metadata
+                        cleaned_documents.append(doc)
+                    else:
+                        # 辞書形式の場合はDocumentオブジェクトに変換
+                        if isinstance(doc, dict):
+                            # メタデータをクリーンアップ
+                            cleaned_metadata = {}
+                            metadata = doc.get('metadata', {})
+                            for key, value in metadata.items():
+                                if isinstance(value, (str, int, float, bool, type(None))):
+                                    cleaned_metadata[key] = value
+                                else:
+                                    cleaned_metadata[key] = str(value)
+                            
+                            cleaned_doc = Document(
+                                page_content=doc.get('page_content', ''),
+                                metadata=cleaned_metadata
+                            )
+                            cleaned_documents.append(cleaned_doc)
+                        else:
+                            cleaned_documents.append(doc)
+                
+                print(f"  [OK] Loaded {len(cleaned_documents)} documents from cache (Fast Load)")
+                return cleaned_documents
                 
         except Exception as e:
             print(f"  [WARNING] Cache load failed: {e}")
@@ -326,9 +366,32 @@ def load_documents(documents_path: str = "./documents") -> List:
     if documents:
         try:
             print("  Saving document cache...")
+            # メタデータをクリーンアップしてから保存
+            cleaned_documents_for_cache = []
+            for doc in documents:
+                # メタデータをクリーンアップ
+                cleaned_metadata = {}
+                for key, value in doc.metadata.items():
+                    # シリアライズ可能な型のみを保持
+                    if isinstance(value, (str, int, float, bool, type(None))):
+                        cleaned_metadata[key] = value
+                    elif isinstance(value, (list, tuple)):
+                        # リストやタプルは文字列に変換
+                        cleaned_metadata[key] = str(value)
+                    else:
+                        # その他は文字列に変換
+                        cleaned_metadata[key] = str(value)
+                
+                # クリーンアップしたメタデータで新しいDocumentオブジェクトを作成
+                cleaned_doc = Document(
+                    page_content=doc.page_content,
+                    metadata=cleaned_metadata
+                )
+                cleaned_documents_for_cache.append(cleaned_doc)
+            
             cache_data = {
                 'file_state': current_files_state,
-                'documents': documents
+                'documents': cleaned_documents_for_cache
             }
             with open(docs_cache_path, 'wb') as f:
                 pickle.dump(cache_data, f)
