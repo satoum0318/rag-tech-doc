@@ -117,18 +117,25 @@ def generate_document_summary(documents: List, client) -> str:
     print("[INFO] Generating document summary with LLM...")
     
     try:
-        # 全文書のテキストを結合（最大10,000文字まで）
+        # 全文書のテキストを結合（コンテキスト長エラーを防ぐため短めに制限）
+        # 日本語はトークン数が多くなりがちなので、約3000文字程度に制限
         combined_text = ""
+        max_chars = 3000
+        
+        # 各ドキュメントから少しずつ抽出して多様性を確保
+        chars_per_doc = max(100, max_chars // len(documents))
+        
         for doc in documents:
-            combined_text += doc.page_content + "\n\n"
-            if len(combined_text) > 10000:
-                combined_text = combined_text[:10000] + "..."
+            content = doc.page_content[:chars_per_doc]
+            combined_text += content + "\n\n"
+            if len(combined_text) > max_chars:
+                combined_text = combined_text[:max_chars] + "..."
                 break
         
         # LLMに概要生成を依頼
-        prompt = f"""以下の技術文書の内容を分析して、包括的な概要を日本語で作成してください。
+        prompt = f"""以下の技術文書の内容（抜粋）を分析して、包括的な概要を日本語で作成してください。
 
-【文書内容】
+【文書内容（抜粋）】
 {combined_text}
 
 【出力形式】
@@ -158,6 +165,7 @@ def generate_document_summary(documents: List, client) -> str:
 def load_documents(documents_path: str = "./documents") -> List:
     """
     指定されたフォルダから技術文書を読み込む
+    キャッシュがあればそれを使用し、変更があれば再読み込みする
     
     Args:
         documents_path: ドキュメントが格納されているフォルダのパス
@@ -165,7 +173,69 @@ def load_documents(documents_path: str = "./documents") -> List:
     Returns:
         読み込まれた文書のリスト
     """
+    import pickle
+    
     print(f"[1/4] Loading documents from: {documents_path}")
+    
+    # キャッシュディレクトリの準備
+    cache_dir = "./vectorstore_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    docs_cache_path = os.path.join(cache_dir, "documents_cache.pkl")
+    
+    # 現在のファイル状態を取得（パスと更新日時）
+    current_files_state = {}
+    
+    # 対象とする拡張子
+    target_extensions = ["*.txt", "*.pdf", "*.docx"]
+    all_files = []
+    
+    for ext in target_extensions:
+        all_files.extend(glob.glob(os.path.join(documents_path, ext)))
+        
+    for file_path in all_files:
+        try:
+            # 絶対パスでキーを作成し、mtimeを保存
+            abs_path = os.path.abspath(file_path)
+            mtime = os.path.getmtime(file_path)
+            current_files_state[abs_path] = mtime
+        except Exception:
+            pass
+            
+    # キャッシュの確認
+    if os.path.exists(docs_cache_path):
+        try:
+            print("  Checking document cache...")
+            with open(docs_cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            
+            cached_state = cached_data.get('file_state', {})
+            cached_documents = cached_data.get('documents', [])
+            
+            # 状態の比較
+            # 1. ファイル数が同じか
+            # 2. すべてのファイルの更新日時が同じか
+            is_cache_valid = True
+            
+            if len(current_files_state) != len(cached_state):
+                print("  [INFO] File count changed, reloading...")
+                is_cache_valid = False
+            else:
+                for path, mtime in current_files_state.items():
+                    if path not in cached_state or cached_state[path] != mtime:
+                        print(f"  [INFO] File changed: {os.path.basename(path)}")
+                        is_cache_valid = False
+                        break
+            
+            if is_cache_valid and cached_documents:
+                print(f"  [OK] Loaded {len(cached_documents)} documents from cache (Fast Load)")
+                return cached_documents
+                
+        except Exception as e:
+            print(f"  [WARNING] Cache load failed: {e}")
+            # キャッシュ読み込み失敗時は通常読み込みへ
+            
+    # ここから通常読み込み（変更があった場合や初回）
+    print("  Reloading all documents...")
     documents = []
     
     # TXTファイルを読み込む（エンコーディング指定）
@@ -252,6 +322,20 @@ def load_documents(documents_path: str = "./documents") -> List:
         except Exception as e:
             print(f"  [WARNING] Failed to load {file_path}: {e}")
     
+    # 読み込み完了後、キャッシュに保存
+    if documents:
+        try:
+            print("  Saving document cache...")
+            cache_data = {
+                'file_state': current_files_state,
+                'documents': documents
+            }
+            with open(docs_cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+            print("  [OK] Document cache saved")
+        except Exception as e:
+            print(f"  [WARNING] Failed to save document cache: {e}")
+            
     print(f"[OK] Loaded {len(documents)} documents")
     return documents
 
@@ -599,9 +683,29 @@ def chat(message: str, history: List) -> str:
                     })
                 
                 for source_name, chunks in seen_sources.items():
-                    answer += f"### 📄 {source_name}\n"
+                    # PDFファイルへのリンクを作成
                     if source_name.endswith('.pdf'):
-                        answer += f"📍 場所: `documents/{source_name}`\n\n"
+                        # ファイルの絶対パスを取得
+                        source_path = None
+                        for doc in docs[:5]:
+                            if os.path.basename(doc.metadata.get('source', '')) == source_name:
+                                source_path = doc.metadata.get('source', '')
+                                break
+                        
+                        if source_path and os.path.exists(source_path):
+                            # Gradioのファイルサーバー経由でアクセス可能なURLを作成
+                            # ファイルパスをエンコードしてリンクとして表示
+                            # Windowsパスの場合は正規化が必要
+                            normalized_path = source_path.replace('\\', '/')
+                            file_url = f"/file={normalized_path}"
+                            answer += f"### 📄 [{source_name}]({file_url})\n"
+                            answer += f"📍 場所: `documents/{source_name}`\n"
+                            answer += f"💡 [📥 PDFを開く/ダウンロード]({file_url})\n\n"
+                        else:
+                            answer += f"### 📄 {source_name}\n"
+                            answer += f"📍 場所: `documents/{source_name}`\n\n"
+                    else:
+                        answer += f"### 📄 {source_name}\n"
                     
                     for idx, chunk_info in enumerate(chunks, 1):
                         if chunk_info['page'] is not None:
@@ -632,7 +736,14 @@ def chat(message: str, history: List) -> str:
             
             # ページ情報付きで表示
             page_info = f" (ページ {page + 1})" if page is not None else ""
-            answer += f"### 📄 関連箇所 {i}: {source_name}{page_info}\n\n"
+            
+            # PDFファイルへのリンクを作成
+            if source_name.endswith('.pdf') and os.path.exists(source):
+                normalized_path = source.replace('\\', '/')
+                file_url = f"/file={normalized_path}"
+                answer += f"### 📄 関連箇所 {i}: [{source_name}]({file_url}){page_info}\n\n"
+            else:
+                answer += f"### 📄 関連箇所 {i}: {source_name}{page_info}\n\n"
             
             # 各ドキュメントの内容を表示
             content = doc.page_content[:600]  # 表示を増やす
@@ -650,10 +761,17 @@ def chat(message: str, history: List) -> str:
             source_name = os.path.basename(source)
             if source_name not in seen_sources:
                 source_path = os.path.abspath(source)
-                answer += f"- **{source_name}**\n"
-                answer += f"  📍 `{source_path}`\n"
-                if source_name.endswith('.pdf'):
-                    answer += f"  💡 エクスプローラーで開いて確認できます\n"
+                
+                # PDFファイルへのリンクを作成
+                if source_name.endswith('.pdf') and os.path.exists(source):
+                    normalized_path = source.replace('\\', '/')
+                    file_url = f"/file={normalized_path}"
+                    answer += f"- **[{source_name}]({file_url})**\n"
+                    answer += f"  📍 `{source_path}`\n"
+                    answer += f"  💡 [📥 PDFを開く/ダウンロード]({file_url})\n"
+                else:
+                    answer += f"- **{source_name}**\n"
+                    answer += f"  📍 `{source_path}`\n"
                 answer += "\n"
                 seen_sources.add(source_name)
         
@@ -748,7 +866,7 @@ def main():
             ],
             title="",
             description="",
-            theme=gr.themes.Soft(),
+            # theme引数はChatInterfaceでは無効（Blocksで設定済み）
         )
     
     # アプリを起動
@@ -760,12 +878,16 @@ def main():
     print("=" * 60)
     
     try:
+        # documentsフォルダの絶対パスを取得（ファイルサーバー機能用）
+        documents_abs_path = os.path.abspath("./documents")
+        
         demo.launch(
             share=False,  # 公開リンクを生成しない
             server_name="0.0.0.0",  # LAN内の全てのマシンからアクセス可能
             server_port=7861,  # ポート番号（7860が使用中のため7861に変更）
             auth=authenticate_user,  # ユーザー名/パスワード認証
             auth_message="🔍 TechScout - 東洋電機製造株式会社 開発センター基盤技術部",
+            allowed_paths=[documents_abs_path],  # PDFファイルへのアクセスを許可
         )
     except KeyboardInterrupt:
         print("\n[INFO] Server stopped by user")
